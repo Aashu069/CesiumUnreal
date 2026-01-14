@@ -1,3 +1,30 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:50781a8d8b8a458295855914dc6a053ad5f178384c4d98ff251dac82c2e52eb6
-size 949
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+using UnrealBuildTool;
+
+public class Cesiumstart : ModuleRules
+{
+	public Cesiumstart(ReadOnlyTargetRules Target) : base(Target)
+	{
+		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+		
+		// Use UE5.7 compatible warning setting
+		UndefinedIdentifierWarningLevel = WarningLevel.Off;
+	
+		PublicDependencyModuleNames.AddRange(new string[] { 
+			"Core", 
+			"CoreUObject", 
+			"Engine", 
+			"InputCore",
+			"Sockets",      // For UDP socket support
+			"Networking"    // For FUdpSocketReceiver and related classes
+		});
+		
+		// Add CesiumRuntime for Cesium actor access (not needed for vertex extraction!)
+		// We use standard UE APIs - CesiumGltfPrimitiveComponent IS a UStaticMeshComponent
+		// So we can access mesh data without private headers - no breaking risk!
+		PrivateDependencyModuleNames.AddRange(new string[] {
+			"CesiumRuntime"  // For CesiumGeoreference coordinate conversion
+		});
+	}
+}

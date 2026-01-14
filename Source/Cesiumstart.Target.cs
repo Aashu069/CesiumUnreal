@@ -1,3 +1,15 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:334538fbacd1548b4f06c7ae705010d79c62f41c8656616a435241141e81d11a
-size 398
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+using UnrealBuildTool;
+using System.Collections.Generic;
+
+public class CesiumstartTarget : TargetRules
+{
+	public CesiumstartTarget(TargetInfo Target) : base(Target)
+	{
+		Type = TargetType.Game;
+		DefaultBuildSettings = BuildSettingsVersion.V6;
+		IncludeOrderVersion = EngineIncludeOrderVersion.Latest;
+		ExtraModuleNames.Add("Cesiumstart");
+	}
+}
