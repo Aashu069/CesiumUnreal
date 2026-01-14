@@ -1,13 +1,39 @@
-# Unreal generated files
-.vs/
+# =============================================================================
+# Unreal Engine + Cesium .gitignore
+# =============================================================================
+
+# ----- UNREAL GENERATED FOLDERS (NEVER COMMIT) -----
 Binaries/
 Build/
 DerivedDataCache/
 Intermediate/
 Saved/
-*.sln
 
-# Cesium / SQLite cache (NEVER commit)
+# ----- IDE/EDITOR FILES -----
+.vs/
+.vscode/
+.idea/
+*.sln
+*.suo
+*.user
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+
+# ----- CESIUM CACHE (NEVER COMMIT) -----
 cesium-request-cache.sqlite*
 *.sqlite
 *.sqlite-*
+*.sqlite-shm
+*.sqlite-wal
+CesiumCache/
+
+# ----- OS FILES -----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ----- CRASH REPORTS -----
+*.dmp
+CrashReportClient.ini

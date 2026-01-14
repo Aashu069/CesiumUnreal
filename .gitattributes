@@ -1,9 +1,61 @@
+# =============================================================================
+# Git LFS Configuration for Unreal Engine + Cesium
+# =============================================================================
+# RULE: ONLY binary assets should be in LFS
+# NEVER add: .cpp, .h, .cs, .ini, .uproject, .json, .txt, .md
+# =============================================================================
+
+# ----- BINARY ASSETS (LFS) -----
 *.uasset filter=lfs diff=lfs merge=lfs -text
 *.umap filter=lfs diff=lfs merge=lfs -text
 *.pak filter=lfs diff=lfs merge=lfs -text
+
+# ----- COMPRESSED FILES (LFS) -----
 *.zip filter=lfs diff=lfs merge=lfs -text
 *.7z filter=lfs diff=lfs merge=lfs -text
+*.rar filter=lfs diff=lfs merge=lfs -text
+
+# ----- BINARIES (LFS) -----
 *.exe filter=lfs diff=lfs merge=lfs -text
 *.dll filter=lfs diff=lfs merge=lfs -text
-cesium-request-cache.sqlite !text -filter -merge -diff
-cesium-request-cache.sqlite-wal !text -filter -merge -diff
+*.so filter=lfs diff=lfs merge=lfs -text
+*.dylib filter=lfs diff=lfs merge=lfs -text
+
+# ----- LARGE MEDIA (LFS) -----
+*.png filter=lfs diff=lfs merge=lfs -text
+*.jpg filter=lfs diff=lfs merge=lfs -text
+*.jpeg filter=lfs diff=lfs merge=lfs -text
+*.tga filter=lfs diff=lfs merge=lfs -text
+*.bmp filter=lfs diff=lfs merge=lfs -text
+*.psd filter=lfs diff=lfs merge=lfs -text
+*.hdr filter=lfs diff=lfs merge=lfs -text
+*.exr filter=lfs diff=lfs merge=lfs -text
+*.mp3 filter=lfs diff=lfs merge=lfs -text
+*.wav filter=lfs diff=lfs merge=lfs -text
+*.ogg filter=lfs diff=lfs merge=lfs -text
+*.mp4 filter=lfs diff=lfs merge=lfs -text
+*.mov filter=lfs diff=lfs merge=lfs -text
+*.avi filter=lfs diff=lfs merge=lfs -text
+*.fbx filter=lfs diff=lfs merge=lfs -text
+*.obj filter=lfs diff=lfs merge=lfs -text
+*.blend filter=lfs diff=lfs merge=lfs -text
+
+# ----- FORCE TEXT FILES TO NEVER USE LFS -----
+# This explicitly prevents source files from ever being added to LFS
+*.cpp text -filter -diff=cpp
+*.h text -filter -diff=cpp
+*.hpp text -filter -diff=cpp
+*.c text -filter -diff=c
+*.cs text -filter -diff=csharp
+*.ini text -filter
+*.cfg text -filter
+*.json text -filter
+*.uproject text -filter
+*.uplugin text -filter
+*.Build.cs text -filter
+*.Target.cs text -filter
+*.md text -filter
+*.txt text -filter
+*.xml text -filter
+*.gitignore text -filter
+*.gitattributes text -filter
