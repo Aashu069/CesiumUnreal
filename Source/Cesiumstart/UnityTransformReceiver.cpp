@@ -2,9 +2,11 @@
 // Implementation of UDP receiver for Unity flight simulator bridge
 
 #include "UnityTransformReceiver.h"
+#include "ConfigLoader.h"
 #include "CesiumGeoreference.h"
 #include "Kismet/GameplayStatics.h"
 #include "DrawDebugHelpers.h"
+#include "Camera/CameraComponent.h"
 
 AUnityTransformReceiver::AUnityTransformReceiver()
 {
@@ -15,6 +17,27 @@ AUnityTransformReceiver::AUnityTransformReceiver()
 void AUnityTransformReceiver::BeginPlay()
 {
     Super::BeginPlay();
+    
+    // Load runtime configuration from GameConfig.ini
+    FRuntimeConfig Config = UConfigLoader::LoadConfig();
+    
+    // Apply config values (only if they differ from defaults, allowing editor overrides)
+    if (!Config.ListenIP.IsEmpty())
+    {
+        ListenIP = Config.ListenIP;
+    }
+    if (Config.ListenPort > 0)
+    {
+        ListenPort = Config.ListenPort;
+    }
+    if (!Config.TargetActorNamePattern.IsEmpty())
+    {
+        TargetActorNamePattern = Config.TargetActorNamePattern;
+    }
+    
+    UE_LOG(LogTemp, Log, TEXT("[UnityBridge] Config applied - IP: %s, Port: %d, Target: %s"), 
+        *ListenIP, ListenPort, *TargetActorNamePattern);
+    
     StartUDPReceiver();
 }
 
@@ -131,6 +154,16 @@ bool AUnityTransformReceiver::ParsePacket(const FString& DataString, FUnityAircr
     OutData.QuatZ = FCString::Atof(*Parts[7]);
     OutData.QuatW = FCString::Atof(*Parts[8]);
     
+    // Camera Quaternion (indices 9,10,11,12) - optional
+    if (Parts.Num() >= 13)
+    {
+        OutData.CamQuatX = FCString::Atof(*Parts[9]);
+        OutData.CamQuatY = FCString::Atof(*Parts[10]);
+        OutData.CamQuatZ = FCString::Atof(*Parts[11]);
+        OutData.CamQuatW = FCString::Atof(*Parts[12]);
+        OutData.bHasCameraData = true;
+    }
+    
     if (bDebugLog)
     {
         UE_LOG(LogTemp, Log, TEXT("[UnityBridge] ECEF Pos: (%f, %f, %f), Quat: (%f, %f, %f, %f)"), 
@@ -203,7 +236,29 @@ void AUnityTransformReceiver::ApplyTransformToTarget()
     
     // Convert ECEF position to Unreal world position
     FVector EcefPosition(LatestData.EcefX, LatestData.EcefY, LatestData.EcefZ);
-    FVector UnrealPosition = GeoRef->TransformEarthCenteredEarthFixedPositionToUnreal(EcefPosition);
+    FVector TargetPosition = GeoRef->TransformEarthCenteredEarthFixedPositionToUnreal(EcefPosition);
+    
+    // Apply position with optional lerp for smooth movement
+    FVector UnrealPosition;
+    if (bEnablePositionLerp)
+    {
+        // Initialize lerp position on first valid data
+        if (!bHasLerpPosition)
+        {
+            CurrentLerpPosition = TargetPosition;
+            bHasLerpPosition = true;
+        }
+        
+        // Interpolate towards target position
+        float DeltaTime = GetWorld()->GetDeltaSeconds();
+        CurrentLerpPosition = FMath::VInterpTo(CurrentLerpPosition, TargetPosition, DeltaTime, PositionLerpSpeed);
+        UnrealPosition = CurrentLerpPosition;
+    }
+    else
+    {
+        // Direct position update (no interpolation)
+        UnrealPosition = TargetPosition;
+    }
     
     // Apply position to target actor
     TargetAircraft->SetActorLocation(UnrealPosition);
@@ -232,8 +287,55 @@ void AUnityTransformReceiver::ApplyTransformToTarget()
     FinalQuat = FinalQuat * YawCorrection;
     FinalQuat.Normalize();
     
+    // Apply rotation with optional slerp for smooth rotation
+    FQuat AppliedRotation;
+    if (bEnableRotationSlerp)
+    {
+        // Initialize slerp rotation on first valid data
+        if (!bHasSlerpRotation)
+        {
+            CurrentSlerpRotation = FinalQuat;
+            bHasSlerpRotation = true;
+        }
+        
+        // Spherical interpolation towards target rotation
+        float DeltaTime = GetWorld()->GetDeltaSeconds();
+        CurrentSlerpRotation = FQuat::Slerp(CurrentSlerpRotation, FinalQuat, FMath::Clamp(RotationSlerpSpeed * DeltaTime, 0.0f, 1.0f));
+        CurrentSlerpRotation.Normalize();
+        AppliedRotation = CurrentSlerpRotation;
+    }
+    else
+    {
+        // Direct rotation update (no interpolation)
+        AppliedRotation = FinalQuat;
+    }
+    
     // Apply rotation to target actor
-    TargetAircraft->SetActorRotation(FinalQuat);
+    TargetAircraft->SetActorRotation(AppliedRotation);
+    
+    // ============================================================
+    // Camera Local Rotation Sync
+    // Quaternion axis mapping: Unity -> Unreal
+    // ============================================================
+    if (LatestData.bHasCameraData && TargetCamera && false) // Disabled for now , remove last false to enable
+    {
+        // Axis mapping for camera local rotation
+        FQuat CamQuat(
+            LatestData.CamQuatZ,    // Unreal X (roll) = Unity Z (roll)
+            LatestData.CamQuatX,    // Unreal Y (pitch) = Unity X (pitch)
+            -LatestData.CamQuatY,   // Unreal Z (yaw) = -Unity Y 
+            LatestData.CamQuatW
+        );
+        CamQuat.Normalize();
+        
+        // Apply -90 degree yaw correction to fix camera facing left
+        FQuat CamYawCorrection = FQuat(FVector::UpVector, PI / 2.0f);  // -90 degrees around Z
+        CamQuat = CamYawCorrection * CamQuat;
+        CamQuat.Normalize();
+        
+        // Set as relative rotation (camera is child of aircraft)
+        TargetCamera->SetRelativeRotation(CamQuat);
+    }
     
     if (bDebugLog)
     {
@@ -278,10 +380,30 @@ void AUnityTransformReceiver::TryFindTargetAircraft()
         {
             FString ActorName = Actor->GetName();
             
+            // Skip Cesium-related actors to avoid conflicts with CesiumVertexSampler
+            if (ActorName.Contains(TEXT("Cesium"), ESearchCase::IgnoreCase) ||
+                ActorName.Contains(TEXT("Tileset"), ESearchCase::IgnoreCase) ||
+                ActorName.Contains(TEXT("VertexSampler"), ESearchCase::IgnoreCase) ||
+                ActorName.Contains(TEXT("FoliageSpawner"), ESearchCase::IgnoreCase))
+            {
+                continue;
+            }
+            
             if (ActorName.Contains(TargetActorNamePattern, ESearchCase::IgnoreCase))
             {
                 TargetAircraft = Actor;
                 UE_LOG(LogTemp, Log, TEXT("[UnityBridge] Found target aircraft: %s"), *ActorName);
+                
+                // Auto-find camera component from target aircraft
+                if (!TargetCamera)
+                {
+                    TargetCamera = TargetAircraft->FindComponentByClass<UCameraComponent>();
+                    if (TargetCamera)
+                    {
+                        UE_LOG(LogTemp, Log, TEXT("[UnityBridge] Found camera component: %s"), *TargetCamera->GetName());
+                    }
+                }
+                
                 return;
             }
         }

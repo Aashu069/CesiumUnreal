@@ -54,6 +54,26 @@ struct FUnityAircraftData
     /** Raw quaternion W from Unity (EUN frame) */
     UPROPERTY(BlueprintReadOnly, Category = "Aircraft Data")
     float QuatW = 0.0f;
+
+    /** Camera local quaternion X from Unity */
+    UPROPERTY(BlueprintReadOnly, Category = "Aircraft Data")
+    float CamQuatX = 0.0f;
+
+    /** Camera local quaternion Y from Unity */
+    UPROPERTY(BlueprintReadOnly, Category = "Aircraft Data")
+    float CamQuatY = 0.0f;
+
+    /** Camera local quaternion Z from Unity */
+    UPROPERTY(BlueprintReadOnly, Category = "Aircraft Data")
+    float CamQuatZ = 0.0f;
+
+    /** Camera local quaternion W from Unity */
+    UPROPERTY(BlueprintReadOnly, Category = "Aircraft Data")
+    float CamQuatW = 1.0f;
+
+    /** Whether camera data was received in this packet */
+    UPROPERTY(BlueprintReadOnly, Category = "Aircraft Data")
+    bool bHasCameraData = false;
 };
 
 /**
@@ -90,6 +110,10 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Target")
     AActor* TargetAircraft;
 
+    /** The camera component to sync rotation (will auto-find from TargetAircraft if not set) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Target")
+    class UCameraComponent* TargetCamera;
+
     /** If true, automatically find target aircraft by name if not assigned */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Target")
     bool bAutoFindTarget = true;
@@ -102,7 +126,25 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Target")
     float TargetSearchInterval = 1.0f;
 
-    // ==================== Data ====================
+    // ==================== Interpolation ====================
+    
+    /** Enable smooth position interpolation (lerp) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Interpolation")
+    bool bEnablePositionLerp = true;
+
+    /** Speed of position interpolation (higher = faster, snappier movement) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Interpolation", meta = (ClampMin = "0.1", ClampMax = "50.0", EditCondition = "bEnablePositionLerp"))
+    float PositionLerpSpeed = 15.0f;
+
+    /** Enable smooth rotation interpolation (slerp) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Interpolation")
+    bool bEnableRotationSlerp = true;
+
+    /** Speed of rotation interpolation (higher = faster, snappier rotation) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Interpolation", meta = (ClampMin = "0.1", ClampMax = "50.0", EditCondition = "bEnableRotationSlerp"))
+    float RotationSlerpSpeed = 15.0f;
+
+    // ==================== Data ==
     
     /** Latest received aircraft data (for debugging/blueprints) */
     UPROPERTY(BlueprintReadOnly, Category = "Data")
@@ -145,6 +187,18 @@ private:
     
     /** Track if we've logged first position (avoid static variable memory leak) */
     bool bFirstPositionApplied = false;
+
+    /** Current interpolated position for smooth movement */
+    FVector CurrentLerpPosition = FVector::ZeroVector;
+
+    /** Whether we have a valid lerp starting position */
+    bool bHasLerpPosition = false;
+
+    /** Current interpolated rotation for smooth rotation */
+    FQuat CurrentSlerpRotation = FQuat::Identity;
+
+    /** Whether we have a valid slerp starting rotation */
+    bool bHasSlerpRotation = false;
 
     /** Initialize and start the UDP socket receiver */
     void StartUDPReceiver();

@@ -10,16 +10,20 @@
 #include "TimerManager.h"
 
 namespace {
-static const FName CandidateVectorParams[] = {
-    FName(TEXT("BaseColorFactor")),
-    FName(TEXT("baseColorFactor")),
-    FName(TEXT("BaseColor")),
-    FName(TEXT("Color")),
-    FName(TEXT("Tint")),
-    FName(TEXT("Albedo")),
-    FName(TEXT("AlbedoColor")),
-    FName(TEXT("BaseColorTint")),
-};
+// Lazy initialization to avoid static FName crash during module load
+static const TArray<FName>& GetCandidateVectorParams() {
+    static TArray<FName> Params = {
+        FName(TEXT("BaseColorFactor")),
+        FName(TEXT("baseColorFactor")),
+        FName(TEXT("BaseColor")),
+        FName(TEXT("Color")),
+        FName(TEXT("Tint")),
+        FName(TEXT("Albedo")),
+        FName(TEXT("AlbedoColor")),
+        FName(TEXT("BaseColorTint")),
+    };
+    return Params;
+}
 
 static FLinearColor HexSRGB(const TCHAR* Hex) {
   FLinearColor Linear;
@@ -302,7 +306,7 @@ bool UCesiumTileMaterialSwapperComponent::TryGetBaseColorLinear(
   }
 
   // Try common parameter names used by glTF/Cesium materials.
-  for (const FName& ParamName : CandidateVectorParams) {
+  for (const FName& ParamName : GetCandidateVectorParams()) {
     FLinearColor Value;
 
 #if ENGINE_MAJOR_VERSION >= 5

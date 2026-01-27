@@ -8,6 +8,9 @@
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
 #include "CesiumVertexSampler.generated.h"
 
+// Forward declaration
+class ACesiumGeoreference;
+
 // Struct to hold spawn configuration
 USTRUCT(BlueprintType)
 struct FCesiumSpawnConfig
@@ -185,6 +188,15 @@ private:
 	
 	// Track which component pointers we've already processed
 	TSet<UPrimitiveComponent*> ProcessedComponents;
+	
+	// Track retry counts for components that fail extraction (prevents infinite requeue)
+	TMap<TWeakObjectPtr<UStaticMeshComponent>, int32> ComponentRetryCounts;
+	
+	// Track last observed transforms to detect when tile placement is stable
+	TMap<TWeakObjectPtr<UStaticMeshComponent>, FTransform> LastObservedTransforms;
+
+	// Cached CesiumGeoreference for ECEF to Unreal coordinate conversion (needed in packaged builds)
+	ACesiumGeoreference* CachedGeoreference = nullptr;
 
 	// Batch spawning helper
 	void SpawnBatchForTarget(FStreamingTarget& Target, const TArray<FVector>& Vertices);
