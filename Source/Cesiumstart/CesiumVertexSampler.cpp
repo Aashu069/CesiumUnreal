@@ -1,9 +1,16 @@
 // CesiumVertexSampler.cpp
 // Direct vertex extraction from Cesium 3D Tilesets - NO line tracing!
-// Uses standard UE APIs only - CesiumGltfPrimitiveComponent IS a UStaticMeshComponent!
+// Uses Cesium's CPU-safe PositionAccessor for packaged build compatibility
+
+// NOMINMAX MUST be defined before ANY includes to prevent windows.h min/max macros
+// from breaking std::numeric_limits<T>::max() in Cesium/UE headers
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 
 #include "CesiumVertexSampler.h"
 #include "CesiumGeoreference.h"
+#include "CesiumLoadedTile.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
@@ -11,7 +18,13 @@
 #include "StaticMeshResources.h"
 #include "Rendering/PositionVertexBuffer.h"
 
-// Windows SEH for catching Cesium buffer access violations
+// Include Cesium private header to access PositionAccessor (CPU-safe vertex data)
+// This is necessary because GPU vertex buffers are not accessible in packaged builds
+THIRD_PARTY_INCLUDES_START
+#include "CesiumRuntime/Private/CesiumPrimitive.h"
+THIRD_PARTY_INCLUDES_END
+
+// Windows SEH for catching Cesium buffer access violations (fallback path only)
 #include "Windows/AllowWindowsPlatformTypes.h"
 #include <windows.h>
 #include "Windows/HideWindowsPlatformTypes.h"
@@ -564,8 +577,10 @@ void ACesiumVertexSampler::SpawnBatchForTarget(FStreamingTarget& Target, const T
 		// Use bWorldSpace=TRUE - instances are in world coordinates
 		Target.HISM->AddInstances(BatchTransforms, false, true);
 		
-		// CRITICAL: Force full update of the HISM rendering state
-		Target.HISM->BuildTreeIfOutdated(true, false);
+		// CRITICAL FIX: Force SYNCHRONOUS tree build to prevent flickering
+		// The second parameter MUST be true (bForceSync) to prevent async rebuilds
+		// that cause instances to flicker in and out during tree construction
+		Target.HISM->BuildTreeIfOutdated(true, true);  // Force sync build!
 		Target.HISM->MarkRenderStateDirty();
 		
 		Target.InstancesSpawned += BatchTransforms.Num();
@@ -624,6 +639,21 @@ void ACesiumVertexSampler::AddStreamingTarget(
 	UE_LOG(LogTemp, Warning, TEXT("  - Registered: %s"), TargetHISM->IsRegistered() ? TEXT("YES") : TEXT("NO"));
 	UE_LOG(LogTemp, Warning, TEXT("  - Component Location: %s"), *TargetHISM->GetComponentLocation().ToString());
 	UE_LOG(LogTemp, Warning, TEXT("  - Current Instance Count: %d"), TargetHISM->GetInstanceCount());
+
+	// ========================================================================
+	// FIX: Prevent flickering caused by occlusion queries and async tree builds
+	// These settings are CRITICAL for stable HISM rendering
+	// ========================================================================
+	TargetHISM->bDisableCollision = false;  // Keep collision if needed
+	TargetHISM->SetBoundsScale(5.0f);       // Expand bounds to prevent aggressive culling
+	TargetHISM->bNeverDistanceCull = true;  // Never cull by distance
+	TargetHISM->bUseAsOccluder = false;     // Don't use as occluder (prevents self-occlusion issues)
+	
+	// CRITICAL: Disable occlusion queries - this is often the cause of flickering!
+	// When HW occlusion queries take more than 1 frame, instances flicker
+	TargetHISM->bAllowCullDistanceVolume = false;
+	
+	UE_LOG(LogTemp, Warning, TEXT("  - Applied anti-flicker settings: BoundsScale=5, NeverDistanceCull=true, UseAsOccluder=false"));
 
 	FStreamingTarget NewTarget;
 	NewTarget.HISM = TargetHISM;
@@ -947,7 +977,117 @@ TArray<FVector> ACesiumVertexSampler::ExtractVerticesFromComponent(UPrimitiveCom
 		return Vertices;
 	}
 
-	// CesiumGltfPrimitiveComponent inherits from UStaticMeshComponent
+	// CesiumGltfPrimitiveComponent implements ICesiumPrimitive interface
+	// This gives us access to CPU-safe PositionAccessor (critical for packaged builds!)
+	ICesiumPrimitive* CesiumPrimitive = Cast<ICesiumPrimitive>(Component);
+	
+	if (CesiumPrimitive)
+	{
+		// ========================================================================
+		// PRIMARY PATH: Use Cesium's CPU-safe PositionAccessor
+		// This works in BOTH editor and packaged builds because it reads from
+		// CPU memory, not GPU-only vertex buffers.
+		// ========================================================================
+		
+		const CesiumPrimitiveData& PrimData = CesiumPrimitive->getPrimitiveData();
+		const auto& PositionAccessor = PrimData.PositionAccessor;
+		
+		const int64 NumVertices = PositionAccessor.size();
+		if (NumVertices == 0)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[CesiumVtx] ExtractVertices: PositionAccessor has 0 vertices"));
+			return Vertices;
+		}
+		
+		UE_LOG(LogTemp, Log, TEXT("[CesiumVtx] Using CPU-safe PositionAccessor with %lld vertices"), NumVertices);
+		
+		// Get component transform for world positioning
+		const FTransform CompTransform = Component->GetComponentToWorld();
+		if (!CompTransform.IsValid())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[CesiumVtx] ExtractVertices: Invalid component transform"));
+			return Vertices;
+		}
+		
+		// Get the scale factor that Cesium applies to vertices
+		// This is (1024, -1024, 1024) - scale by 1024 and flip Y axis
+		const FVector ScaleFactor = FVector(
+			CesiumPrimitiveData::positionScaleFactor,
+			-CesiumPrimitiveData::positionScaleFactor,  // Y-flip for glTF→Unreal handedness
+			CesiumPrimitiveData::positionScaleFactor
+		);
+		
+		// Cap vertices to prevent excessive processing
+		const int64 MaxVerticesPerComponent = 50000;
+		const int64 VerticesToProcess = FMath::Min(NumVertices, MaxVerticesPerComponent);
+		
+		Vertices.Reserve(static_cast<int32>(VerticesToProcess));
+		
+		int32 NaNCount = 0;
+		int32 AbsurdCount = 0;
+		int32 AddedCount = 0;
+		
+		for (int64 i = 0; i < VerticesToProcess; i++)
+		{
+			// Read raw glTF position from CPU-safe accessor
+			const FVector3f& RawGltfPos = PositionAccessor[i];
+			
+			// Skip invalid positions
+			if (!FMath::IsFinite(RawGltfPos.X) ||
+				!FMath::IsFinite(RawGltfPos.Y) ||
+				!FMath::IsFinite(RawGltfPos.Z))
+			{
+				NaNCount++;
+				continue;
+			}
+			
+			// Apply Cesium's internal transformation (scale + Y-flip)
+			// This converts from raw glTF coordinates to the space that ComponentToWorld expects
+			const FVector LocalPos(
+				RawGltfPos.X * ScaleFactor.X,
+				RawGltfPos.Y * ScaleFactor.Y,  // Y is negated
+				RawGltfPos.Z * ScaleFactor.Z
+			);
+			
+			// Transform to world coordinates
+			FVector WorldPos = CompTransform.TransformPosition(LocalPos);
+			
+			// Validate world position
+			if (WorldPos.ContainsNaN() ||
+				!FMath::IsFinite(WorldPos.X) ||
+				!FMath::IsFinite(WorldPos.Y) ||
+				!FMath::IsFinite(WorldPos.Z))
+			{
+				NaNCount++;
+				continue;
+			}
+			
+			// Filter absurd coordinates (garbage data protection)
+			static constexpr double MaxReasonableCoord = 1e9;
+			if (FMath::Abs(WorldPos.X) > MaxReasonableCoord ||
+				FMath::Abs(WorldPos.Y) > MaxReasonableCoord ||
+				FMath::Abs(WorldPos.Z) > MaxReasonableCoord)
+			{
+				AbsurdCount++;
+				continue;
+			}
+			
+			Vertices.Add(WorldPos);
+			AddedCount++;
+		}
+		
+		UE_LOG(LogTemp, Log, TEXT("[CesiumVtx] PositionAccessor extraction: Added=%d, NaN=%d, Absurd=%d"),
+			AddedCount, NaNCount, AbsurdCount);
+		
+		return Vertices;
+	}
+	
+	// ========================================================================
+	// FALLBACK PATH: Use GPU vertex buffer (for non-Cesium StaticMeshComponents)
+	// This path is kept for compatibility but may not work in packaged builds
+	// for Cesium tiles specifically.
+	// ========================================================================
+	
 	UStaticMeshComponent* MeshComp = Cast<UStaticMeshComponent>(Component);
 	
 	if (MeshComp && MeshComp->GetStaticMesh())
@@ -961,7 +1101,6 @@ TArray<FVector> ACesiumVertexSampler::ExtractVerticesFromComponent(UPrimitiveCom
 			return Vertices;
 		}
 		
-		// Cache RenderData once to avoid race conditions from multiple GetRenderData() calls
 		const FStaticMeshRenderData* RenderData = Mesh->GetRenderData();
 		if (!RenderData || RenderData->LODResources.Num() == 0)
 		{
@@ -979,180 +1118,64 @@ TArray<FVector> ACesiumVertexSampler::ExtractVerticesFromComponent(UPrimitiveCom
 			return Vertices;
 		}
 		
-		UE_LOG(LogTemp, Log, TEXT("[CesiumVtx] ExtractVertices: Found %d vertices, proceeding..."), NumVertices);
+		UE_LOG(LogTemp, Log, TEXT("[CesiumVtx] FALLBACK: Using GPU buffer with %d vertices"), NumVertices);
 		
-		// Cap vertices to prevent excessive processing
-		const uint32 MaxVerticesPerComponent = 50000;
-		if (NumVertices > MaxVerticesPerComponent)
-		{
-			NumVertices = MaxVerticesPerComponent;
-		}
-		
-		// Fix 1: Comprehensive transform validation for Cesium streaming tiles (UE 5.7 compatible)
 		const FTransform CompTransform = MeshComp->GetComponentToWorld();
-		
-		// Check transform is valid (handles NaN, uninitialized, etc.)
 		if (!CompTransform.IsValid())
 		{
 			return Vertices;
 		}
 		
-		// Check scale is valid (prevents NIL matrix / non-invertible matrix errors)
-		const FVector Scale = CompTransform.GetScale3D();
-		if (Scale.ContainsNaN() ||
-			!FMath::IsFinite(Scale.X) ||
-			!FMath::IsFinite(Scale.Y) ||
-			!FMath::IsFinite(Scale.Z) ||
-			Scale.IsNearlyZero(1e-6f))
-		{
-			return Vertices;
-		}
+		// Cap vertices
+		const uint32 MaxVerticesPerComponent = 50000;
+		NumVertices = FMath::Min(NumVertices, MaxVerticesPerComponent);
 		
-		// Check location and rotation are valid
-		const FVector Location = CompTransform.GetLocation();
-		if (Location.ContainsNaN() ||
-			!FMath::IsFinite(Location.X) ||
-			!FMath::IsFinite(Location.Y) ||
-			!FMath::IsFinite(Location.Z) ||
-			!CompTransform.GetRotation().IsNormalized())
-		{
-			return Vertices;
-		}
-		
-		// NOTE: Transform stability check removed - Cesium replaces component pointers when
-		// tiles refine, so the "same" tile has a different pointer each time. This was causing
-		// infinite deferral. SEH protection + coordinate validation handles bad data instead.
-		
-		// Get component bounds for reference (used for logging only now)
-		FBoxSphereBounds Bounds = MeshComp->Bounds;
-		
-		// ========================================================================
-		// UNITY APPROACH: Copy the entire vertex buffer to safe memory FIRST
-		// This eliminates the race condition where Cesium can free the buffer
-		// mid-iteration. We copy once, then iterate over our safe copy.
-		// ========================================================================
-		
-		// Get raw buffer data pointer and validate
+		// Get raw buffer data and copy to safe memory
 		const void* RawBufferData = PositionBuffer.GetVertexData();
 		if (!RawBufferData)
 		{
-			UE_LOG(LogTemp, Warning, TEXT("[CesiumVtx] ExtractVertices: Buffer data pointer is null"));
 			return Vertices;
 		}
 		
 		const uint32 Stride = PositionBuffer.GetStride();
 		if (Stride == 0 || Stride < sizeof(FVector3f))
 		{
-			UE_LOG(LogTemp, Warning, TEXT("[CesiumVtx] ExtractVertices: Invalid stride %d"), Stride);
 			return Vertices;
-		}
-		
-		// Calculate total buffer size
-		const SIZE_T TotalBufferSize = static_cast<SIZE_T>(NumVertices) * Stride;
-		
-		// Sanity check - max 50MB buffer copy (prevents memory bombs)
-		const SIZE_T MaxBufferSize = 50 * 1024 * 1024;
-		if (TotalBufferSize > MaxBufferSize)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[CesiumVtx] ExtractVertices: Buffer too large (%llu bytes), capping"), TotalBufferSize);
-			NumVertices = static_cast<uint32>(MaxBufferSize / Stride);
 		}
 		
 		const SIZE_T ActualBufferSize = static_cast<SIZE_T>(NumVertices) * Stride;
 		
-		// Allocate our safe copy
 		TArray<uint8> SafeVertexData;
 		SafeVertexData.SetNumUninitialized(ActualBufferSize);
 		
-		// Copy the buffer using SEH-protected memcpy
-		// If Cesium frees the buffer during this copy, we catch it and abort
 		if (!SafeMemcpyWithSEH(SafeVertexData.GetData(), RawBufferData, ActualBufferSize))
 		{
-			UE_LOG(LogTemp, Warning, TEXT("[CesiumVtx] ExtractVertices: Buffer was freed during copy (SEH caught)"));
+			UE_LOG(LogTemp, Warning, TEXT("[CesiumVtx] FALLBACK: Buffer was freed during copy"));
 			return Vertices;
 		}
 		
-		// SUCCESS! We now have a safe copy of the vertex data
-		// Cesium can free the original buffer - we don't care anymore!
-		UE_LOG(LogTemp, Log, TEXT("[CesiumVtx] Successfully copied %llu bytes to safe buffer, processing %d vertices..."), 
-			ActualBufferSize, NumVertices);
-		
 		Vertices.Reserve(NumVertices);
-		
-		int32 NaNLocalCount = 0;
-		int32 NaNWorldCount = 0;
-		int32 AbsurdCoordCount = 0;
-		int32 AddedCount = 0;
-		int32 EcefConvertedCount = 0;
-		
-		// Iterate over our SAFE COPY - no more SEH needed per-vertex!
 		const uint8* SafeDataPtr = SafeVertexData.GetData();
+		
+		int32 AddedCount = 0;
 		
 		for (uint32 i = 0; i < NumVertices; i++)
 		{
-			// Read from our safe copy using pointer arithmetic
 			const FVector3f* LocalPosPtr = reinterpret_cast<const FVector3f*>(SafeDataPtr + (i * Stride));
 			const FVector3f LocalPos = *LocalPosPtr;
 			
-			// Skip invalid vertex positions (NaN/Inf from corrupted data)
-			if (!FMath::IsFinite(LocalPos.X) ||
-				!FMath::IsFinite(LocalPos.Y) ||
-				!FMath::IsFinite(LocalPos.Z))
+			if (!FMath::IsFinite(LocalPos.X) || !FMath::IsFinite(LocalPos.Y) || !FMath::IsFinite(LocalPos.Z))
 			{
-				NaNLocalCount++;
 				continue;
 			}
 			
-			// Transform local vertex to world coordinates using component transform
 			FVector WorldPos = CompTransform.TransformPosition(FVector(LocalPos));
 			
-			// Only add valid world positions
 			if (WorldPos.ContainsNaN() ||
-				!FMath::IsFinite(WorldPos.X) ||
-				!FMath::IsFinite(WorldPos.Y) ||
-				!FMath::IsFinite(WorldPos.Z))
+				FMath::Abs(WorldPos.X) > 1e9 ||
+				FMath::Abs(WorldPos.Y) > 1e9 ||
+				FMath::Abs(WorldPos.Z) > 1e9)
 			{
-				NaNWorldCount++;
-				continue;
-			}
-			
-			// ========================================================================
-			// PACKAGED BUILD FIX: Detect ECEF coordinates and convert to Unreal
-			// In packaged builds, ComponentToWorld may give ECEF coordinates (millions of units)
-			// instead of proper Unreal world coordinates.
-			// 
-			// Detection: If coordinate magnitude is > 1,000,000 (10km), it's likely ECEF
-			// ECEF coords are measured from Earth's center (~6,371 km radius)
-			// ========================================================================
-			static constexpr double EcefThreshold = 1000000.0; // 10km in cm
-			const double CoordMagnitude = WorldPos.Size();
-			
-			if (CoordMagnitude > EcefThreshold && CachedGeoreference)
-			{
-				// Convert ECEF to Unreal using Georeference
-				WorldPos = CachedGeoreference->TransformEarthCenteredEarthFixedPositionToUnreal(WorldPos);
-				EcefConvertedCount++;
-				
-				// Validate converted position
-				if (WorldPos.ContainsNaN() ||
-					!FMath::IsFinite(WorldPos.X) ||
-					!FMath::IsFinite(WorldPos.Y) ||
-					!FMath::IsFinite(WorldPos.Z))
-				{
-					NaNWorldCount++;
-					continue;
-				}
-			}
-			
-			// Filter truly absurd coordinates (prevents memory issues)
-			// After potential ECEF conversion, coords should be reasonable
-			// Using 1e9 (10,000 km) - generous but catches garbage
-			static constexpr double MaxReasonableWorldCoord = 1e9;
-			if (FMath::Abs(WorldPos.X) > MaxReasonableWorldCoord ||
-				FMath::Abs(WorldPos.Y) > MaxReasonableWorldCoord ||
-				FMath::Abs(WorldPos.Z) > MaxReasonableWorldCoord)
-			{
-				AbsurdCoordCount++;
 				continue;
 			}
 			
@@ -1160,18 +1183,7 @@ TArray<FVector> ACesiumVertexSampler::ExtractVerticesFromComponent(UPrimitiveCom
 			AddedCount++;
 		}
 		
-		UE_LOG(LogTemp, Log, TEXT("[CesiumVtx] Vertex extraction: Added=%d, ECEF_Converted=%d, NaNLocal=%d, NaNWorld=%d, Absurd=%d, HasGeoreference=%s"),
-			AddedCount, EcefConvertedCount, NaNLocalCount, NaNWorldCount, AbsurdCoordCount,
-			CachedGeoreference ? TEXT("YES") : TEXT("NO"));
-		
-		// Log transform info for debugging Cesium coordinate issues
-		if (AddedCount == 0 && NumVertices > 0)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[CesiumVtx] ALL VERTICES FILTERED! Transform: Loc=(%.1f, %.1f, %.1f) Scale=(%.4f, %.4f, %.4f)"),
-				Location.X, Location.Y, Location.Z, Scale.X, Scale.Y, Scale.Z);
-		}
-		
-		// Return whatever vertices we extracted (or empty if none)
+		UE_LOG(LogTemp, Log, TEXT("[CesiumVtx] FALLBACK extraction: Added=%d vertices"), AddedCount);
 	}
 
 	return Vertices;
