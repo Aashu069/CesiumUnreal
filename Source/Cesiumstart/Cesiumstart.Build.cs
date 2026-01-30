@@ -16,8 +16,9 @@ public class Cesiumstart : ModuleRules
 			"CoreUObject", 
 			"Engine", 
 			"InputCore",
-			"Sockets",      // For UDP socket support
-			"Networking"    // For FUdpSocketReceiver and related classes
+			"Sockets",              // For UDP socket support
+			"Networking",           // For FUdpSocketReceiver and related classes
+			"ProceduralMeshComponent"  // For ShrinkWrap runtime mesh modification
 		});
 		
 		// Add CesiumRuntime for Cesium actor access (not needed for vertex extraction!)
