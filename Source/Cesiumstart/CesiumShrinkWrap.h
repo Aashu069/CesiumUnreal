@@ -1,14 +1,20 @@
 // CesiumShrinkWrap.h
 // ShrinkWrap functionality for conforming meshes to Cesium terrain
 // Ported concept from Unity Deora.Tools.ShrinkWrap for Unreal Engine
+// Updated to support Cesium 3D Tilesets using ICesiumPrimitive interface
 
 #pragma once
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "Components/StaticMeshComponent.h"
+#include "Components/PrimitiveComponent.h"
 #include "ProceduralMeshComponent.h"
 #include "KismetProceduralMeshLibrary.h"
+
+// Forward declaration for Cesium interface
+class ICesiumPrimitive;
+
 #include "CesiumShrinkWrap.generated.h"
 
 // Raycast direction enum (similar to Unity version)
@@ -68,6 +74,55 @@ struct FShrinkWrapConfig
 	// Smoothing iterations (only used if bSmoothResults is true)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shrink Wrap Config", meta = (EditCondition = "bSmoothResults", ClampMin = "1", ClampMax = "10"))
 	int32 SmoothingIterations = 2;
+
+	// How to handle vertices that don't hit terrain
+	// 0 = Keep original position (may look disconnected)
+	// 1 = Use average Z of successfully wrapped vertices (can cause wall artifacts)
+	// 2 = Use fallback height offset from original position
+	// 3 = Interpolate from nearest neighbors using IDW (RECOMMENDED - prevents walls)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shrink Wrap Config", meta = (ClampMin = "0", ClampMax = "3"))
+	int32 MissedVertexHandling = 3;  // Default to IDW interpolation
+
+	// Fallback height offset for missed vertices (only used if MissedVertexHandling = 2)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shrink Wrap Config", meta = (EditCondition = "MissedVertexHandling == 2"))
+	float FallbackHeightOffset = 0.0f;
+
+	// Maximum distance to search for neighbor vertices when using IDW interpolation (cm)
+	// Used when MissedVertexHandling = 3. Larger values = smoother but slower.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shrink Wrap Config")
+	float NeighborSearchRadius = 10000.0f;  // 100 meters
+
+	// Power parameter for IDW interpolation (p=2 is standard inverse distance squared)
+	// Higher values give more weight to nearest points
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shrink Wrap Config", meta = (ClampMin = "1.0", ClampMax = "4.0"))
+	float IDWPower = 2.0f;
+
+	// Minimum percentage of vertices that must hit terrain (0.0 to 1.0)
+	// Below this threshold, the mesh is skipped
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shrink Wrap Config", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float MinHitRatio = 0.05f;  // At least 5% must hit
+
+	// If true, skip mesh components with no successful hits (keeps original visible)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shrink Wrap Config")
+	bool bSkipFullyMissedMeshes = true;
+
+	// Auto-retry settings for when terrain isn't loaded yet (e.g., starting in air)
+	// If hit ratio is below MinHitRatio, will retry after RetryInterval seconds
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shrink Wrap Config|Auto Retry")
+	bool bAutoRetryOnLowHitRate = true;
+
+	// Maximum number of retry attempts
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shrink Wrap Config|Auto Retry", meta = (EditCondition = "bAutoRetryOnLowHitRate", ClampMin = "1", ClampMax = "20"))
+	int32 MaxRetryAttempts = 10;
+
+	// Seconds between retry attempts
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shrink Wrap Config|Auto Retry", meta = (EditCondition = "bAutoRetryOnLowHitRate", ClampMin = "1.0", ClampMax = "30.0"))
+	float RetryInterval = 3.0f;
+
+	// Minimum hit ratio required to consider the wrap successful (for retry logic)
+	// If below this, will retry. Set higher than MinHitRatio for more aggressive retrying.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shrink Wrap Config|Auto Retry", meta = (EditCondition = "bAutoRetryOnLowHitRate", ClampMin = "0.1", ClampMax = "1.0"))
+	float RetryHitRatioThreshold = 0.5f;  // Retry if less than 50% hit
 };
 
 // Result of a wrap operation
@@ -233,8 +288,18 @@ public:
 	// ==================== CONFIGURATION ====================
 	
 	// The source mesh actor to wrap (e.g., your water tileset)
+	// If this is null at runtime, will try to find by SourceMeshActorName or SourceMeshActorTag
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shrink Wrap")
 	AActor* SourceMeshActor;
+
+	// Fallback: Name of the source actor to find if SourceMeshActor is null
+	// Use this for packaged builds where direct references might be lost
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shrink Wrap")
+	FString SourceMeshActorName;
+
+	// Fallback: Tag to search for if SourceMeshActor and SourceMeshActorName are empty
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shrink Wrap")
+	FName SourceMeshActorTag;
 
 	// Shrink wrap configuration
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shrink Wrap")
@@ -264,6 +329,14 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "Shrink Wrap|State")
 	bool bIsWrapping = false;
 
+	// Current retry attempt count
+	UPROPERTY(BlueprintReadOnly, Category = "Shrink Wrap|State")
+	int32 CurrentRetryAttempt = 0;
+
+	// Last wrap hit ratio (for debugging)
+	UPROPERTY(BlueprintReadOnly, Category = "Shrink Wrap|State")
+	float LastHitRatio = 0.0f;
+
 	// ==================== PUBLIC METHODS ====================
 
 	// Main wrap function for all mesh components in the source actor
@@ -274,24 +347,35 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Shrink Wrap")
 	FShrinkWrapResult WrapMeshComponent(UStaticMeshComponent* MeshComponent);
 
+	// Wrap a Cesium primitive component (CesiumGltfPrimitiveComponent)
+	// Uses ICesiumPrimitive interface for CPU-safe vertex access (works in packaged builds)
+	FShrinkWrapResult WrapCesiumPrimitive(UPrimitiveComponent* Component, ICesiumPrimitive* CesiumPrimitive);
+
 	// Reset all wrapped meshes
 	UFUNCTION(BlueprintCallable, Category = "Shrink Wrap")
 	void ResetAllWraps();
 
 private:
-	// Track created procedural meshes for cleanup
-	UPROPERTY()
+	// Track created procedural meshes for cleanup (runtime only, not serialized)
+	UPROPERTY(Transient)
 	TArray<UProceduralMeshComponent*> CreatedProceduralMeshes;
 
-	// Original mesh components that were hidden
-	UPROPERTY()
+	// Original mesh components that were hidden (runtime only, not serialized)
+	UPROPERTY(Transient)
 	TArray<UStaticMeshComponent*> HiddenOriginalMeshes;
+
+	// Hidden Cesium primitive components (runtime only, not serialized)
+	UPROPERTY(Transient)
+	TArray<UPrimitiveComponent*> HiddenCesiumPrimitives;
 
 	// Debug points
 	TArray<FWrapDebugPoint> DebugPoints;
 
 	// Timer for auto-updates
 	float TimeSinceLastUpdate = 0.0f;
+
+	// Execute wrap with retry logic
+	void ExecuteWrapWithRetry();
 
 	// Get raycast direction
 	FVector GetRaycastDirection() const;

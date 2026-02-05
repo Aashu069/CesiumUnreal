@@ -53,6 +53,10 @@
 		{
 			"Name": "IKRig",
 			"Enabled": false
+		},
+		{
+			"Name": "HDRIBackdrop",
+			"Enabled": true
 		}
 	]
 }
